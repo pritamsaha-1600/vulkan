@@ -122,7 +122,7 @@ void Application::createSurface() {
         .window = window
     };
     if (vkCreateXlibSurfaceKHR(instance, &surfaceCreateInfo, nullptr, &surface) != VK_SUCCESS)
-        print_error("vkCreateXlibSurfaceKHR failed: Couldn't create Vulkan Presentation Surface", true);
+        return print_error("vkCreateXlibSurfaceKHR failed: Couldn't create Vulkan Presentation Surface", true);
 }
 
 void Application::printDeviceProperties(VkPhysicalDevice physical_device) {
@@ -146,18 +146,14 @@ void Application::createDevice() {
     std::vector<const char*> deviceExtensions = {
         VK_KHR_SWAPCHAIN_EXTENSION_NAME
     };
-    VkPhysicalDevice physical_device = VK_NULL_HANDLE;
-    constexpr float queue_priorities[] = {1.0f};
-    VkDeviceQueueCreateInfo queue_create_info = {
-        .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
-        .queueCount = 1,
-        .pQueuePriorities = queue_priorities
-    };
+
+    physical_device = VK_NULL_HANDLE;
+    unsigned queue_family_index = std::numeric_limits<unsigned>::max();
     for (const auto _device : devices) {
-        unsigned device_count;
-        vkEnumerateDeviceExtensionProperties(_device, nullptr, &device_count, nullptr);
-        std::vector<VkExtensionProperties> availableExtensions(device_count);
-        vkEnumerateDeviceExtensionProperties(_device, nullptr, &device_count, availableExtensions.data());
+        unsigned extension_count;
+        vkEnumerateDeviceExtensionProperties(_device, nullptr, &extension_count, nullptr);
+        std::vector<VkExtensionProperties> availableExtensions(extension_count);
+        vkEnumerateDeviceExtensionProperties(_device, nullptr, &extension_count, availableExtensions.data());
 
         bool all_extension_supported = true;
         for (const auto extension : deviceExtensions)
@@ -176,12 +172,15 @@ void Application::createDevice() {
         vkGetPhysicalDeviceQueueFamilyProperties(_device, &queue_family_count, queue_families.data());
 
         for (const auto [i, queue_family] : std::views::enumerate(queue_families)) {
+            /* TODO: the same queue might not support both the surface and the graphics bit
+                    implement logic for when these queues differ
+            */
             VkBool32 supported = false;
             vkGetPhysicalDeviceSurfaceSupportKHR(_device, i, surface, &supported);
             if (supported && queue_family.queueCount > 0 && (queue_family.queueFlags & VK_QUEUE_GRAPHICS_BIT)) {
                 // printDeviceProperties(_device);
 
-                queue_create_info.queueFamilyIndex = i;
+                queue_family_index = i;
                 physical_device = _device;
                 break;
             }
@@ -193,6 +192,13 @@ void Application::createDevice() {
         return print_error("No suitable device found which supports the required extensions, the surface, "
             "and has a queue family with the desired properties.", true);
 
+    constexpr float queue_priorities = 1.0f;
+    VkDeviceQueueCreateInfo queue_create_info = {
+        .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+        .queueFamilyIndex = queue_family_index,
+        .queueCount = 1,
+        .pQueuePriorities = &queue_priorities,
+    };
     VkDeviceCreateInfo device_create_info = {
         .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
         .queueCreateInfoCount = 1,
@@ -203,8 +209,85 @@ void Application::createDevice() {
     if (vkCreateDevice(physical_device, &device_create_info, nullptr, &device) != VK_SUCCESS)
         return print_error("vkCreateDevice failed: Couldn't create Vulkan device", true);
     vkGetDeviceQueue(device, queue_create_info.queueFamilyIndex, 0, &queue);
+}
 
-    printDeviceProperties(physical_device);
+void Application::createSwapchain() {
+    VkSurfaceCapabilitiesKHR surface_capabilities;
+    vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physical_device, surface, &surface_capabilities);
+
+    auto image_count = surface_capabilities.minImageCount + 1;
+
+    VkExtent2D image_extent = surface_capabilities.currentExtent;
+    // if currentExtent is set to invalid value
+    if (image_extent.height == std::numeric_limits<unsigned>::max() ||
+        image_extent.width == std::numeric_limits<unsigned>::max())
+        image_extent = {.width = width, .height = height};
+    else {
+        print_error(std::format("Window width and height changed from ({},{}) to ({}, {})",
+            width, height, image_extent.width, image_extent.height), false);
+        width = image_extent.width;
+        height = image_extent.height;
+    }
+
+    VkSurfaceTransformFlagBitsKHR transform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+    VkCompositeAlphaFlagBitsKHR composite_alpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+    VkImageUsageFlagBits image_usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    VkSurfaceFormatKHR image_format {.format = VK_FORMAT_B8G8R8A8_UNORM, .colorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR};
+    VkSharingMode sharing_mode = VK_SHARING_MODE_EXCLUSIVE;
+    VkPresentModeKHR present_mode = VK_PRESENT_MODE_MAILBOX_KHR;
+    VkSwapchainKHR old_swapchain = swapchain;
+
+    VkSwapchainCreateInfoKHR swapchain_create_info = {
+        .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
+        .surface = surface,
+        .minImageCount = image_count,
+        .imageFormat = image_format.format,
+        .imageColorSpace = image_format.colorSpace,
+        .imageExtent = image_extent,
+        .imageArrayLayers = 1,
+        .imageUsage = image_usage,
+        .imageSharingMode = sharing_mode,
+        .preTransform = transform,
+        .compositeAlpha = composite_alpha,
+        .presentMode = present_mode,
+        .clipped = VK_TRUE,
+        .oldSwapchain = old_swapchain
+    };
+    if (vkCreateSwapchainKHR(device, &swapchain_create_info, nullptr, &swapchain) != VK_SUCCESS)
+        return print_error("vkCreateSwapchainKHR failed: Couldn't create Vulkan swapchain", true);
+    if (old_swapchain != VK_NULL_HANDLE)
+        destroySwapchain(old_swapchain);
+
+    unsigned images_count;
+    vkGetSwapchainImagesKHR(device, swapchain, &images_count, nullptr);
+    swapchain_images.resize(images_count);
+    vkGetSwapchainImagesKHR(device, swapchain, &images_count, swapchain_images.data());
+
+    swapchain_image_views.resize(images_count);
+    VkComponentMapping component_mapping = {
+        .r = VK_COMPONENT_SWIZZLE_IDENTITY,
+        .g = VK_COMPONENT_SWIZZLE_IDENTITY,
+        .b = VK_COMPONENT_SWIZZLE_IDENTITY,
+        .a = VK_COMPONENT_SWIZZLE_IDENTITY
+    };
+    VkImageSubresourceRange subresource_range = {
+        .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+        .baseMipLevel = 0,
+        .levelCount = 1,
+        .baseArrayLayer = 0,
+        .layerCount = 1
+    };
+    for (const auto [i, swapchain_image] : std::views::enumerate(swapchain_images)) {
+        VkImageViewCreateInfo image_view_create_info = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+            .image = swapchain_image,
+            .viewType = VK_IMAGE_VIEW_TYPE_2D,
+            .format = image_format.format,
+            .components = component_mapping,
+            .subresourceRange = subresource_range
+        };
+        vkCreateImageView(device, &image_view_create_info, nullptr, &swapchain_image_views[i]);
+    }
 }
 
 Application::Application(unsigned width, unsigned height, unsigned minWidth, unsigned minHeight,
@@ -215,16 +298,29 @@ Application::Application(unsigned width, unsigned height, unsigned minWidth, uns
     createVulkanInstance();
     createSurface();
     createDevice();
+    if (requireValidationLayers)
+        printDeviceProperties(physical_device);
+    createSwapchain();
+}
+
+void Application::destroySwapchain(VkSwapchainKHR swapchain) {
+    for (auto &swapchain_image_view : swapchain_image_views)
+        vkDestroyImageView(device, swapchain_image_view, nullptr);
+    vkDestroySwapchainKHR(device, swapchain, nullptr);
 }
 
 Application::~Application() {
+    destroySwapchain(swapchain);
+    vkDestroyDevice(device, nullptr);
+    vkDestroySurfaceKHR(instance, surface, nullptr);
+    vkDestroyInstance(instance, nullptr);
     XDestroyWindow(display, window);
     XCloseDisplay(display);
 }
 
 void Application::processEvents() {
-    XEvent event;
     while (XPending(display) > 0) {
+        XEvent event;
         XNextEvent(display, &event);
 
         switch (event.type) {
@@ -233,7 +329,8 @@ void Application::processEvents() {
                     is_window_visible = false;
                 break;
             case ClientMessage:
-                if (static_cast<Atom>(event.xclient.data.l[0]) == WM_DELETE_WINDOW)
+                // WM_DELETE_WINDOW might be None
+                if (WM_DELETE_WINDOW != None && static_cast<Atom>(event.xclient.data.l[0]) == WM_DELETE_WINDOW)
                     is_window_visible = false;
                 break;
         }
